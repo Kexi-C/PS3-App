@@ -4,3 +4,4 @@ pandas
 scipy
 scikit-learn
 joblib
+openpyxl>=3.1,<4
