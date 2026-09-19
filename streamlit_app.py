@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import importlib.util
 import sys
 import tempfile
 from pathlib import Path
 
-import pandas as pd
 import streamlit as st
 
 
@@ -16,8 +14,7 @@ RAIL_CODE_DIR = APP_DIR / "subsystems" / "rail_corrugation" / "code"
 RAIL_MODEL_PATH = (
     APP_DIR / "subsystems" / "rail_corrugation" / "model" / "rail_model.joblib"
 )
-DOOR_ADAPTER_PATH = APP_DIR / "subsystems" / "door" / "adapter.py"
-SHM_CODE_DIR = APP_DIR / "subsystems" / "shm" / "code"
+ACV_CODE_DIR = APP_DIR / "subsystems" / "acv" / "code"
 
 
 st.set_page_config(
@@ -106,40 +103,53 @@ def run_rail_prediction(uploaded_files):
     return details, submission
 
 
-def _door_adapter():
-    """Load subsystems/door/adapter.py under a unique module name."""
-    name = "door_adapter"
-    if name not in sys.modules:
-        spec = importlib.util.spec_from_file_location(name, DOOR_ADAPTER_PATH)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
-    return sys.modules[name]
+def run_acv_prediction(uploaded_files):
+    """调用原版 acv_rank.py（rank_workbook），不改动其评分与排序逻辑。"""
+    import pandas as pd
 
-
-def run_door_prediction(uploaded_file):
-    """调用 door_standalone.py 的原版分段与分类逻辑，不改动其预测逻辑。"""
-    adapter = _door_adapter()
-    with tempfile.TemporaryDirectory(prefix="door_prediction_") as temp_dir:
-        input_path = Path(temp_dir) / Path(uploaded_file.name).name
-        input_path.write_bytes(uploaded_file.getbuffer())
-        details, segments = adapter.predict(input_path)
-    submission = adapter.submission_table(details)
-    return details, submission, segments
-
-
-def run_shm_prediction(uploaded_files):
-    """调用 part4_shm.py，不改动其预测逻辑。"""
-    code_dir = str(SHM_CODE_DIR)
+    code_dir = str(ACV_CODE_DIR)
     if code_dir not in sys.path:
         sys.path.insert(0, code_dir)
 
-    import part4_shm
+    import acv_rank
 
-    items = [(Path(f.name).name, f.getvalue()) for f in uploaded_files]
-    results = part4_shm.predict_shm_batch(items, include_details=True)
-    csv_bytes = part4_shm.export_shm_csv(results)
-    return results, csv_bytes
+    submission_rows = []
+    detail_rows = []
+    with tempfile.TemporaryDirectory(prefix="acv_prediction_") as temp_dir:
+        temp_dir = Path(temp_dir)
+        for uploaded_file in uploaded_files:
+            safe_name = Path(uploaded_file.name).name
+            if Path(safe_name).suffix.lower() != ".xlsx":
+                raise ValueError(f"ACV input must be an .xlsx file: {safe_name}")
+            input_path = temp_dir / safe_name
+            input_path.write_bytes(uploaded_file.getbuffer())
+
+            try:
+                result = acv_rank.rank_workbook(input_path)
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError(f"{safe_name}: {exc}") from exc
+
+            # ranked_car_ids 保留表头中的原始编号格式（如 "03"），符合提交规范。
+            ranked_ids = result.ranked_car_ids
+            submission_rows.append(
+                {"file_id": safe_name, "ranked_cars": "|".join(ranked_ids)}
+            )
+            rank_of = {car_id: pos for pos, car_id in enumerate(ranked_ids, start=1)}
+            for i, car_id in enumerate(result.car_ids):
+                detail_rows.append(
+                    {
+                        "file_id": safe_name,
+                        "car": car_id,
+                        "rank": rank_of[car_id],
+                        # 原程序得分为 2 倍温度刻度，此处除以 2 还原为 °C。
+                        "mean_excess_temp_C": result.scores[i] / 2,
+                        "eligible_samples": result.valid_counts[i],
+                    }
+                )
+
+    submission = pd.DataFrame(submission_rows, columns=["file_id", "ranked_cars"])
+    details = pd.DataFrame(detail_rows).sort_values(["file_id", "rank"])
+    return details, submission
 
 
 st.markdown(
@@ -171,9 +181,8 @@ with left:
         accept_multiple_files=True,
         label_visibility="collapsed",
         help=(
-            "Door: upload one continuous stream CSV (e.g. Test.csv). "
-            "Rail Corrugation: upload one or more CSV files. "
-            "SHM: upload one or more headerless single-column stress CSV files."
+            "Rail Corrugation: upload CSV files. ACV: upload .xlsx workbooks "
+            "(first worksheet, headers in the first row)."
         ),
     )
 
@@ -191,23 +200,16 @@ with left:
 with right:
     st.markdown('<div class="section-title">Current selection</div>', unsafe_allow_html=True)
     st.info(f"Selected subsystem: **{selected_subsystem}**")
-    if selected_subsystem == "Door":
-        st.markdown(
-            '<div class="placeholder">Door is connected. Upload one continuous door data stream '
-            "(CSV). The program finds every door open/close cycle and labels it "
-            "Normal or Abnormal resistance.</div>",
-            unsafe_allow_html=True,
-        )
-    elif selected_subsystem == "Rail Corrugation":
+    if selected_subsystem == "Rail Corrugation":
         st.markdown(
             '<div class="placeholder">Rail Corrugation is connected. '
             "Upload CSV files and run the original prediction program.</div>",
             unsafe_allow_html=True,
         )
-    elif selected_subsystem == "SHM":
+    elif selected_subsystem == "ACV":
         st.markdown(
-            '<div class="placeholder">SHM is connected. Upload headerless single-column '
-            "stress CSV files to estimate the cumulative fatigue damage of each record.</div>",
+            '<div class="placeholder">ACV is connected. '
+            "Upload .xlsx workbooks to rank cars by refrigerant-leak likelihood.</div>",
             unsafe_allow_html=True,
         )
     else:
@@ -222,30 +224,14 @@ st.markdown('<div class="section-title">Prediction output</div>', unsafe_allow_h
 if run_clicked:
     if not uploaded_files:
         st.error("Please upload at least one input file.")
-    elif selected_subsystem == "Door":
-        if len(uploaded_files) != 1:
-            st.error("Door needs exactly one file: the continuous data stream (e.g. Test.csv).")
-        else:
-            try:
-                with st.spinner("Detecting door cycles and classifying them..."):
-                    door_detail, door_submission, door_segments = run_door_prediction(
-                        uploaded_files[0]
-                    )
-                st.session_state["door_detail_df"] = door_detail
-                st.session_state["door_submission_df"] = door_submission
-                st.session_state["door_segments"] = door_segments
-            except Exception as exc:  # noqa: BLE001
-                st.error(f"Door prediction failed: {exc}")
-    elif selected_subsystem == "SHM":
+    elif selected_subsystem == "ACV":
         try:
-            with st.spinner("Running SHM prediction..."):
-                shm_results, shm_csv = run_shm_prediction(uploaded_files)
-            st.session_state["shm_results"] = shm_results
-            st.session_state["shm_csv"] = shm_csv
+            with st.spinner("Running ACV ranking..."):
+                acv_detail, acv_submission = run_acv_prediction(uploaded_files)
+            st.session_state["acv_detail_df"] = acv_detail
+            st.session_state["acv_submission_df"] = acv_submission
         except Exception as exc:  # noqa: BLE001
-            st.session_state.pop("shm_results", None)
-            st.session_state.pop("shm_csv", None)
-            st.error(f"SHM prediction failed: {exc}")
+            st.error(f"ACV prediction failed: {exc}")
     elif selected_subsystem != "Rail Corrugation":
         st.warning(
             "The application framework is ready, but the selected subsystem has not been connected yet."
@@ -262,23 +248,17 @@ if run_clicked:
 
 detail_df = st.session_state.get("rail_detail_df")
 submission_df = st.session_state.get("rail_submission_df")
-door_detail_df = st.session_state.get("door_detail_df")
-door_submission_df = st.session_state.get("door_submission_df")
-door_segments = st.session_state.get("door_segments")
-shm_results = st.session_state.get("shm_results")
 
-if selected_subsystem == "Door" and door_detail_df is not None:
-    n_total = len(door_detail_df)
-    n_abnormal = int((door_detail_df["prediction"] == "Abnormal resistance").sum())
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Door cycles detected", n_total)
-    c2.metric("Abnormal resistance", n_abnormal)
-    c3.metric("Normal", n_total - n_abnormal)
-    st.dataframe(door_detail_df, use_container_width=True, hide_index=True)
+acv_detail_df = st.session_state.get("acv_detail_df")
+acv_submission_df = st.session_state.get("acv_submission_df")
+
+if selected_subsystem == "ACV" and acv_submission_df is not None:
+    st.dataframe(acv_submission_df, use_container_width=True, hide_index=True)
+    st.dataframe(acv_detail_df, use_container_width=True, hide_index=True)
     st.download_button(
-        "Download door_predictions.csv",
-        data=door_submission_df.to_csv(index=False).encode("utf-8"),
-        file_name="door_predictions.csv",
+        "Download acv_predictions.csv",
+        data=acv_submission_df.to_csv(index=False).encode("utf-8"),
+        file_name="acv_predictions.csv",
         mime="text/csv",
         use_container_width=True,
     )
@@ -291,35 +271,6 @@ elif selected_subsystem == "Rail Corrugation" and detail_df is not None:
         mime="text/csv",
         use_container_width=True,
     )
-elif selected_subsystem == "SHM" and shm_results is not None:
-    shm_table = pd.DataFrame(
-        [
-            {
-                "file_id": r["file_id"],
-                "prediction": r["prediction"],
-                "samples": r["samples"],
-                "cycle_count": r["cycle_count"],
-                "max_amplitude": r["max_amplitude"],
-                "warnings": "; ".join(r["warnings"]),
-            }
-            for r in shm_results
-        ]
-    )
-    st.caption(
-        "prediction: estimated cumulative fatigue damage of each record "
-        "(not a failure probability, health percentage, or remaining life)."
-    )
-    st.dataframe(shm_table, use_container_width=True, hide_index=True)
-    for r in shm_results:
-        for message in r["warnings"]:
-            st.warning(f"{r['file_id']}: {message}")
-    st.download_button(
-        "Download shm_predictions.csv",
-        data=st.session_state["shm_csv"],
-        file_name="shm_predictions.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
 else:
     st.markdown(
         '<div class="placeholder">Prediction results, downloadable output files, and subsystem-specific visualizations will appear here.</div>',
@@ -329,33 +280,9 @@ else:
 
 st.markdown('<div class="section-title">Visualization</div>', unsafe_allow_html=True)
 
-if selected_subsystem == "Door" and door_detail_df is not None:
-    st.caption("Probability of abnormal resistance for each detected cycle (threshold 0.5).")
-    st.bar_chart(door_detail_df.set_index("segment")[["p_abnormal"]])
-
-    segment_no = st.selectbox(
-        "Inspect one cycle",
-        door_detail_df["segment"].tolist(),
-        format_func=lambda k: (
-            f"Cycle {k}: {door_detail_df.loc[k - 1, 'operation']}, "
-            f"{door_detail_df.loc[k - 1, 'prediction']}"
-        ),
-    )
-    trace = _door_adapter().timeline(door_segments[segment_no - 1])
-    trace = trace.assign(time_s=trace["t_ms"] / 1000).set_index("time_s")
-    st.caption(
-        "Deviation from normal behaviour at the same door position, in standard deviations "
-        "(0 = typical; larger values = further from normal)."
-    )
-    st.line_chart(
-        trace[["score", "z_I_s", "z_V_res", "z_power"]].rename(
-            columns={
-                "score": "Combined score",
-                "z_I_s": "Motor current",
-                "z_V_res": "Voltage (motor model residual)",
-                "z_power": "Power",
-            }
-        )
+if selected_subsystem == "ACV" and acv_detail_df is not None:
+    st.bar_chart(
+        acv_detail_df.pivot(index="car", columns="file_id", values="mean_excess_temp_C")
     )
 elif selected_subsystem == "Rail Corrugation" and detail_df is not None:
     chart_columns = [
@@ -367,27 +294,6 @@ elif selected_subsystem == "Rail Corrugation" and detail_df is not None:
         st.bar_chart(detail_df.set_index("file_id")[chart_columns])
     else:
         st.caption("The Rail predictor did not return fault-score columns.")
-elif selected_subsystem == "SHM" and shm_results is not None:
-    chosen = st.selectbox("Select a file", [r["file_id"] for r in shm_results])
-    record = next(r for r in shm_results if r["file_id"] == chosen)
-    st.caption(
-        "Stress signal (original units; x-axis: sample index; "
-        "extrema-preserving display envelope)"
-    )
-    waveform_df = pd.DataFrame(record["waveform"], columns=["sample_index", "stress"])
-    st.line_chart(waveform_df.set_index("sample_index"))
-    bins_df = pd.DataFrame(record["bins"])
-    bins_df.index = [
-        f"{i + 1:02d}: {b['low']:.2f}-{b['high']:.2f}"
-        for i, b in enumerate(record["bins"])
-    ]
-    col_count, col_damage = st.columns(2)
-    with col_count:
-        st.caption("Cycle count by stress-amplitude interval")
-        st.bar_chart(bins_df[["count"]])
-    with col_damage:
-        st.caption("Damage contribution by stress-amplitude interval")
-        st.bar_chart(bins_df[["damage"]])
 else:
     st.markdown(
         '<div class="placeholder">Visualization area reserved for the selected subsystem.</div>',
